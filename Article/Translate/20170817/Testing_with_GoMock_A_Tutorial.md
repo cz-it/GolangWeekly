@@ -189,5 +189,184 @@ user/user_test.go
         testUser.Use()
     }
 
-从代码中，也许不能直观的看到断言是在哪里被执行的，其实是在defer的
+从代码中，也许不能直观的看到断言是在哪里被执行的，其实是在defer的`Finish`调用时触发assert。这样就不会遗漏对assert的调用了。
+
+现在我们就可以运行我们的测试例子了：
+
+    $ go test -v github.com/sgreben/testing-with-gomock/user
+    === RUN   TestUse
+    --- PASS: TestUse (0.00s)
+    PASS
+    ······ok      github.com/sgreben/testing-with-gomock/user     0.007s
+
+如果测试中不止一个mock用例，这里可以共用一个控制器，然后也defer里面调用`Finish`来触发所有的assert。
+
+有时候我们会有这样的需求，函数`Use`的返回值与上面的mock函数`DoSomething`返回的值相同，我们可以写一个新的测试函数，这里假设mock的函数`mockDoer.DoSomething`返回一个虚拟的错误`dummyError`:
+
+user/user_test.go
+
+    func TestUseReturnsErrorFromDo(t *testing.T) {
+        mockCtrl := gomock.NewController(t)
+        defer mockCtrl.Finish()
+
+        dummyError := errors.New("dummy error")
+        mockDoer := mocks.NewMockDoer(mockCtrl)
+        testUser := &user.User{Doer:mockDoer}
+
+        // Expect Do to be called once with 123 and "Hello GoMock" as parameters, and return dummyError from the mocked call.
+        mockDoer.EXPECT().DoSomething(123, "Hello GoMock").Return(dummyError).Times(1)
+
+       err := testUser.Use()
+
+       if err != dummyError {
+            t.Fail()
+		}
+	}
+
+
+## 通过`go:generate`协助GoMock`
+
+从上面的步骤可以知道，当我们有很多的接口或者包要去mock的时候，我们需要用`mockgen`命令为每个要mock的包生成对应的mock实现文件,整个过程非常繁琐。为了解决整个问题我们可以吧`mockgen`放到` go:generate`的注释中来执行。
+
+在我们的例子中，我们可以在我们的文档文件`doc.go`里面的`package`语句后面增加`go:generate`注释.
+
+doer/doer.go
+
+    package doer
+
+    //go:generate mockgen -destination=../mocks/mock_doer.go -package=mocks github.com/sgreben/testing-with-gomock/doer Doer
+
+    type Doer interface {
+        DoSomething(int, string) error
+    }
+
+这里需要注意下，当执行`mockgen`的时候是在目录"doer"目录下，所以这里我们需要指定mock目录为"../mocks/" 而不是之前的"./mocks/"。
+
+现在我们只要在工程目录中简单的执行：
+
+    go generate ./...
+
+并且这里注释中的"//"和"go:generate"之前不能有空格。
+
+一个经验性的在哪里添加"go generate"的注释如下：
+
+* 在每一个要mock的接口文件中增加注释
+* 调用mockgen的时候包含所有的接口
+* 将mock放置在"mocks"包中，并将生成的mock的文件命名为“mocks/mock_X.go”
+
+通过这样的方法，可以防止mockgen工具对真实的非mock接口生成mock文件。
+
+## 使用参数匹配
+有时候，你并不是特别关系mock调用时的参数。在GoMock中，参数可以是一个固定的值，也可以是一串预定义的值。这个机制称为"Match"。"Matcher"定义了一个mock函数可接受的参数，GoMock中定义了如下的"Match"方法：
+
+* gomock.Any(): 选取任何一个参数
+* gomock.Eq(x): 只有等于x的值
+* gomock.Nil(): 匹配 nil
+* gomock.Not(m): 除了m意外的
+* gomock.Not(x): m意外且非继承的
+
+举个例子，假设我们不关心`Do`方法的第一个参数，那么我们可以如下调用：
+
+    mockDoer.EXPECT().DoSomething(gomock.Any(), "Hello GoMock")
+
+GoMock会自动将没有调用"Match"函数的参数默认调用"Eq"方法。所以上面等同于
+
+    mockDoer.EXPECT().DoSomething(gomock.Any(), gomock.Eq("Hello GoMock"))
+
+也可以通过实现`gomock.Matcher`接口来定义自己的"Matcher"
+
+gomock/matchers.go
+
+    type Matcher interface {
+        Matches(x interface{}) bool
+        String() string
+    }
+
+`Matches`方法是真正执行匹配的函数，`String`方法是当不匹配的时候输出的出错信息。如下是一个类型匹配的实现：
+
+match/oftype.go
+
+    package match
+
+    import (
+        "reflect"
+        "github.com/golang/mock/gomock"
+    )
+
+    type ofType struct{ t string }
+
+    func OfType(t string) gomock.Matcher {
+        return &ofType{t}
+    }
+
+    func (o *ofType) Matches(x interface{}) bool {
+         return reflect.TypeOf(x).String() == o.t
+    }
+
+    func (o *ofType) String() string {
+        return "is of type " + o.t
+    }
+
+然后就可以使用如下使用自定的"Matcher"了：
+
+    // Expect Do to be called once with 123 and any string as parameters, and return nil from the mocked call.
+
+    mockDoer.EXPECT().
+    DoSomething(123, match.OfType("string")).
+    Return(nil).
+    Times(1)
+
+这里我们将函数的调用分成了好几行来写，通过这样的书写方式，可以让代码变得更可读。需要注意的是，在Go中，这种分行调用必须将点号写在行的末尾，否则会引起编译错误。
+
+## 断言顺序
+
+一个对象的方法调用顺序是非常重要的，GoMock提供了一种让一个方法跟在另一个方法只有被调用的机制，`.After`方法，比如：
+
+    callFirst := mockDoer.EXPECT().DoSomething(1, "first this")
+    callA := mockDoer.EXPECT().DoSomething(2, "then this").After(callFirst)
+    callB := mockDoer.EXPECT().DoSomething(2, "or this").After(callFirst)
+
+`callA`和`callB`被调用之前，必须先调用`callFirst`
+
+GoMock还提供了`gomock.InOrder`方法，来指定一系列方法的按照指定的顺序进执行。虽然没有`.After`灵活,但是避免了写一堆`.After`的场景，如：
+
+    gomock.InOrder(
+        mockDoer.EXPECT().DoSomething(1, "first this"),
+        mockDoer.EXPECT().DoSomething(2, "then this"),
+        mockDoer.EXPECT().DoSomething(3, "then this"),
+        mockDoer.EXPECT().DoSomething(4, "finally this"),
+    ) 
+
+其实`InOrder`底层也是通过`.After`来实现的。
+
+
+## 指定mock的实现
+
+Mock对象和真实的实现对象不一样的是，他里面没有过多的逻辑，而仅仅是在调用的时候提供一个响应。然后有时候我们需要Mock对象做一些特殊的动作。GoMock提供了`.Do`方法来支持，所有mock函数的执行会附带的先执行`.Do`方法中的函数：
+
+    mockDoer.EXPECT().
+    DoSomething(gomock.Any(), gomock.Any()).
+    Return(nil).
+    Do(func(x int, y string) {
+        fmt.Println("Called with x =",x,"and y =", y)
+    })
+
+对参数检查的断言我们也可以写到`.Do`方法中去。假设我们需要让第一个"int"参数的值，小于或者等于第二个"string"参数的长度，我们可以这样：
+
+    mockDoer.EXPECT().
+    DoSomething(gomock.Any(), gomock.Any()).
+    Return(nil).
+    Do(func(x int, y string) {
+        if x > len(y) {
+            t.Fail()
+        }
+    })
+
+而同样的功能，我们无法通过自定义"matcher"来实现，因为它每次只能匹配一个参数。
+
+## 总结
+在这篇文中，我们演示了如何通过mockgen生成mocks，以及通过`go:generate`注释配合GoMock生成mocks。同时我们还介绍了香港的API，包括了参数检查，调用次数、调用顺序等。
+
+如果你遇到什么问题或者有更好的建议，可以给我留言。
+
 
